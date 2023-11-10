@@ -1,0 +1,405 @@
+# SMILES Parser
+#
+# Parse a SMILES string from stdin and print out a JSON representation of the
+# connection table. The output is in the dialect of CommonChem currently
+# readable by RDKit. (See https://github.com/CommonChem/CommonChem ,
+# https://www.rdkit.org/docs/source/rdkit.Chem.rdMolInterchange.html )
+#
+# The input should consist of the decimal ASCII codes of the characters in the
+# SMILES string, in reverse order. The last character will be ignored, as it is
+# normally a newline.
+#
+# The easiest way of generating the input is by using the `rev` and `od`
+# commands, as in the example below:
+#
+#     echo "[13CH3]C[O-]" | rev | od -t d1 -An | dc - smi.dc
+#
+# prints:
+#
+#    {
+#     "commonchem": {"version": 10},
+#     "defaults": {
+#      "atom":{"stereo":"unspecified"},
+#      "bond":{"stereo":"unspecified"}
+#     },
+#     "molecules": [{
+#      "atoms": [
+#       {"z": 6, "isotope": 13, "chg": 0, "impHs": 3},
+#       {"z": 6, "isotope": 0, "chg": 0},
+#       {"z": 8, "isotope": 0, "chg": -1, "impHs": 0}
+#      ],
+#      "bonds": [
+#       {"atoms": [1, 2], "bo": 1},
+#       {"atoms": [0, 1], "bo": 1}
+#      ]
+#     }]
+#    }
+#
+# UNSUPPORTED FEATURES:
+# - Aromatic atoms
+# - Aromatic or quadruple bonds (:, $)
+# - Wildcard atoms (*)
+# - Two-digit ring labels (%42)
+# - Atom classes (e.g., :42 at the end of a bracketed expression)
+# - Directional bonds (/, \) are accepted but are treated as single bonds
+# - Chiral flags (@, @@) are accepted but ignored.
+# - Elements other than H, B, C, N, O, F, P, S, Cl, Br, I, because our function
+#   to convert symbols into atomic numbers is incomplete.
+#
+# BUGS:
+# - Behavior for invalid or unsupported input is undefined and may range from
+#   producing invalid output to getting into an endless loop. :-)
+# - Ring closure bond order is determined by the closing atom only.
+
+#### Registers used ####
+
+# By convention, we'll use lowercase for variables and uppercase for macros.
+# Variables:
+# n: num_atoms
+# m: num_bonds
+# a: atoms (array of element symbols)
+# b: bonds (stack of [atom1, atom2, bond_order])
+# s: prev_atom (stack of previous atom index)
+# o: bond_order of next bond
+# r: ring_closure_map ({digit: atom_idx})
+# e: error (holds bad char)
+# i: index for loops
+# y: atomic_symbol (int)
+# x: isotopes (array)
+# q: charges (array)
+# h: hydrogen_counts (array)
+# z: trash (store here if we just want to discard top stack entry)
+
+#### Macros ####
+
+# The argument lists of the pseudo function signatures below list the arguments
+# that are consumed from the main stack. "..." is used when an variable number
+# of arguments may be consumed.
+
+# def add_bond():
+[
+    0Sb               # bonds.push([])
+    ls0:b ln1:b lo2:b # bonds[-1] = (prev_atom[-1], num_atoms, bond_order)
+    lm 1+ sm          # num_bonds += 1
+]sB
+
+# def add_atom(char, ...):
+[
+    0sy        # symbol = ''
+    lYx        # symbol += parse_symbol(char, ...)
+    ly ln:a    # atoms[num_atoms] = symbol
+    _1 ln:h    # hcounts[num_atoms] = -1 # (unspecified)
+    ln 1+ sn   # num_atoms += 1
+    ls _1 !=B  # if prev_atom[-1] != -1: add_bond()
+    ln ss      # prev_atom[-1] = num_atoms
+    1so        # bond_order = 1 # (default)
+]sO
+
+# def add_atom_and_break(char, ...):
+[
+    lOx # add_atom(char, ...)
+    q   # break # process next char
+]sA
+
+# def open_branch(char):
+[
+    sz    # pop() # discard "("
+    ls Ss # prev_atom.push(prev_atom[-1])
+    q     # break # process next char
+]s(
+
+# def close_branch(char):
+[
+    sz    # pop() # discard ")"
+    Ls sz # prev_atom.pop()
+    q     # break # process next char
+]s)
+
+# def single_bond(char):
+[
+    sz  # pop () # discard char ("-", "/", or "\")
+    1so # bond_order = 1
+    q   # break # process next char
+]s-
+
+# def double_bond(char):
+[
+    sz  # pop () # discard "="
+    2so # bond_order = 2
+    q   # break # process next char
+]s=
+
+# def triple_bond(char):
+[
+    sz  # pop () # discard "#"
+    3so # bond_order = 3
+    q   # break # process next char
+]s%
+
+# def no_bond(char):
+[
+    sz   # pop () # discard char (.)
+    _1ss # prev_atom[-1] = -1 # clear prev_atom so next atom won't form a bond
+    q    # break # process next char
+]s.
+
+# def close_ring(opening_atom, ring_index):
+[
+    0Sb             # bonds.push([])
+    0:b ln1:b lo2:b # bonds[-1] = (opening_atom, num_atoms, bond_order)
+    lm1+sm          # num_bonds += 1
+    0 r :r          # ring_closure_map[ring_index] = 0
+    3Q              # break # process next char
+]sR
+
+# def handle_ring_index(ring_index):
+[
+    d ;r    # opening_atom = ring_closure_map.get(char, 0)
+    d 0!=R  # if opening_atom != 0: close_ring(opening_atom, ring_index); break
+    sz      # else: pop # discard opening_atom (0)
+    ln r :r # ring_closure_map[ring_index] = num_atoms
+    q       # break # process next char
+]sD
+
+# def parse_isotope(char, ...):
+[
+    48-         # n = chr(char); char = pop()
+    lx 10* + sx # isotope = isotope * 10 + n
+    d 58 r<I    # if isdigit(char): parse_isotope(char, ...)
+]sI
+
+# def return()
+[
+    q
+]sV
+
+# def parse_symbol(char, ...):
+[
+    ly 256*+ sy # symbol += char; char = pop()
+    z0=V        # if len(stack) == 0: return
+    d 96 r>Y    # if islower(char): parse_symbol(char, ...)
+]sY
+
+# def skip_chiral(char, ...):
+[
+    sz       # pop(); char = pop() # discard @
+    d 64 =@  # if char=="@": skip_chiral(char, ...)
+]s@
+
+# def parse_hcount(char, ...):
+[
+    sz  # discard "H"
+    1sh # hcount = 1
+
+    # def maybe_set_hcount(char):
+    [
+        # def set_hcount(char):
+        [
+            48- sh # hcount = chr(char)
+        ]SH
+        d 47 r>H   # if char >= "0": set_hcount()
+        LH sz      # pop inner function
+    ]SH
+    d 58 r<H       # f char <= "9": maybe_set_hcount()
+
+    LH sz          # pop inner function
+]sH
+
+# def parse_neg_charge(char, ...):
+[
+    sz       # pop(); char = pop() # discard "-"
+    lq 1- sq # charge -= 1
+    d 45 =W  # if char == "-": parse_neg_charge(char, ...)
+
+    # def set_neg_charge(char):
+    [
+        48- _1* sq # charge = -chr(char)
+    ]SW
+    d 58 r<W       # digit; set_hcount()
+    LW sz          # pop inner function
+]sW
+
+# def parse_pos_charge(char, ...):
+[
+    sz       # pop(); char = pop() # discard "+"
+    lq 1+ sq # charge += 1
+    d 43 =X  # if char == "+": parse_pos_charge(char, ...)
+
+    # def set_pos_charge(char):
+    [
+        48- sq  # charge = -chr(char)
+    ]SX
+    d 58 r<X    # if isdigit(char): set_hcount()
+    LX sz       # pop inner function
+]sX
+
+# def parse_bracket_atom(char, ...):
+[
+    sz       # discard opening bracket
+    0Sx      # isotope = 0
+    d 58 r<I # if isdigit(char): parse_isotope(char, ...)
+
+    0sy      # symbol = ''
+    lYx      # symbol += parse_symbol(char, ...)
+
+    d 64 =@  # if char=='@': skip_chiral()
+
+    0Sh      # hcount = 0
+    d 72 =H  # if char == 'H': parse_hcount()
+
+    0Sq      # charge = 0
+    d 45 =W  # if char == '-': parse_neg_charge()
+    d 43 =X  # if char == '+': parse_pos_charge()
+
+    sz       # pop (presumed) closing bracket
+    ly       # push(symbol)
+    lOx      # add_atom(char, ...)
+
+    ln 1- dd # get three copies of num_atoms - 1
+    Lx r:x   # isotopes[num_atoms-1] = isotope
+    Lq r:q   # charges[num_atoms-1] = charge
+    Lh r:h   # hcounts[num_atoms-1] = hcount
+
+    q        # break # process next char
+]sK
+
+# def process_char(char, ...):
+[
+    # switch(char):
+    d 35 =%  # '#': triple_bond()
+    d 40 =(  # '(': open_branch()
+    d 41 =)  # ')': close_branch()
+    d 45 =-  # '-': single_bond()
+    d 46 =.  # '.': no_bond()
+    d 47 =-  # '/': single_bond()
+    d 92 =-  # '\': single_bond()
+    d 61 ==  # '=': double_bond()
+    d 91 =K  # open bracket: parse_bracket_atom()
+    d 64 r>A # uppercase letter: add_atom_and_break()
+    d 58 r<D # digit: handle_ring_index()
+    se       # default: store unknown char as error flag
+]sC
+
+# def parse_smiles(char, ...):
+[
+    lCx   # process_char(char, ...)
+    z0!=L # if len(stack) != 0: parse_smiles(char, ...)
+]sL
+
+# def print_comma_and_space():
+[
+    44P32P
+]sQ
+
+# def print_comma_and_newline():
+[
+    44P10P
+]sN
+
+# def print_error():
+[
+    32P32P["error":]P32P[true,]P10P # print "  \"error\": true,\n"
+]sE
+
+# Discard the second element on the stack and break
+[
+    r sz q
+]s>
+
+# def get_atomic_num(symbol)
+[
+    d 1 r 72 => sz
+    d 5 r 66 => sz
+    d 6 r 67 => sz
+    d 7 r 78 => sz
+    d 8 r 79 => sz
+    d 9 r 70 => sz
+    d 15 r 80 => sz
+    d 16 r 83 => sz
+    d 17 r 17260 => sz
+    d 35 r 17010 => sz
+    d 53 r 73 => sz
+    sz 0
+]sF
+
+# print_impHs()
+[
+    lQx                         # print(", ")
+    ["impHs":]P 32P li;h n      # print(f'"impHs": {hcounts[i]}')
+]sG
+
+# def print_atoms():
+[
+    32P 32P 32P 123P            # print('   {')
+    ["z":]P 32P                 # print('"z": ')
+    li;a lFx n                  # print(get_atomic_num(symbol))
+    lQx                         # print(f'"{atoms[i]}", ')
+    ["isotope":]P 32P           # print('"isotope": ')
+    li;x n lQx                  # print(f'{isotopes[i]}, ')
+    ["chg":]P 32P li;q n        # print(f'"chg": {charges[i]}')
+    li;h _1 !=G                 # if hcounts[i] != -1: print_impHs()
+    li 1+ ddsi                  # i += 1; push(i); push(i)
+    125P                        # print('}')
+    ln !=N                      # if i != num_atoms: print_comma_and_newline()
+    ln !=T                      # if i != num_atoms: print_atoms()
+]sT
+
+# def print_bonds():
+[
+    32P 32P 32P 123P           # print('   {')
+    ["atoms":]P 32P 91P
+    0;b 1- n lQx     # print('{bonds[-1][0]}, ' # (atom1)
+    1;b 1- n         # print('{bonds[-1][1]}'   # (atom2)
+    93P lQx
+    ["bo":]P 32P
+    2;b n         # print('{bonds[-1][2]}'   # bond order
+    125P           # print('}')
+    Lbsz          # bonds.pop()
+    li 1+ ddsi    # i += 1
+    lm !=N        # if i != num_bonds: print_comma_and_newline()
+    lm !=U        # if i != num_bonds: print_bonds()
+]sU
+
+# def print_json():
+[
+    123P 10P                                    # print("{\n")
+    le _1 !=E                                   # if error != -1: print_error()
+    32P ["commonchem":]P 32P                    # print('  "commonchem":')
+    123P ["version":]P 32P 10n 125P 44P 10P     # print('{"version": 10\n')
+    32P ["defaults":]P 32P 123P 10P             # print('  "defaults":')
+    32P 32P ["atom":{"stereo":"unspecified"},]P 10P
+    32P 32P ["bond":{"stereo":"unspecified"}]P 10P
+    32P 125P 44P 10P                            # print(" },\n")
+    32P ["molecules":]P 32P 91P 123P 10P        # print('  "defaults":')
+    32P 32P ["atoms":]P 32P 91P 10P             # print('  "atoms": [\n')
+    0si                                         # i = 0
+    ln 0 !=T                                    # if num_atoms != 0: print_atoms()
+    10P 32P 32P 93P lNx                         # print("],\n")
+    32P 32P ["bonds":]P 32P 91P 10P             # print('  "bonds": [')
+    0si                                         # i = 0
+    lm 0 !=U                                    # if num_bonds != 0: print_bonds()
+    10P 32P 32P 93P 10P                         # print("]\n")
+    32P 125P 93P 10P                            # print(" }]\n")
+    125P 10P                                    # print("}\n")
+]sJ
+
+# def pop()
+[
+    sz # discard top of stack
+]sZ
+
+# def main():
+[
+    0sn   # num_atoms = 0
+    0sm   # num_bonds = 0
+    1so   # bond_order = 1
+    _1ss  # prev_atom = [-1]
+    _1se  # error = -1
+    z0!=Z # if len(stack) != 0: pop() # discard newline
+    z0!=L # if len(stack) != 0: parse_smiles(*stack)
+    lJx   # print_json()
+]sM
+
+#### main program ####
+
+lMx # main()
